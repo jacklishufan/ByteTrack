@@ -49,7 +49,7 @@ def get_color(idx):
     return color
 
 
-def plot_tracking(image, tlwhs, obj_ids, scores=None, frame_id=0, fps=0., ids2=None):
+def plot_tracking(image, tlwhs, obj_ids, scores=None, frame_id=0, fps=0., ids2=None,mask=None,scale = 1.0):
     im = np.ascontiguousarray(np.copy(image))
     im_h, im_w = im.shape[:2]
 
@@ -77,6 +77,21 @@ def plot_tracking(image, tlwhs, obj_ids, scores=None, frame_id=0, fps=0., ids2=N
         cv2.rectangle(im, intbox[0:2], intbox[2:4], color=color, thickness=line_thickness)
         cv2.putText(im, id_text, (intbox[0], intbox[1]), cv2.FONT_HERSHEY_PLAIN, text_scale, (0, 0, 255),
                     thickness=text_thickness)
+        if mask is not None:
+            curr_mask = mask[i] * 255
+            # curr_mask = cv2.resize(
+            #     curr_mask,
+            #     (curr_mask.shape[0] / scale,curr_mask.shape[1]//scale),
+            #     interpolation=cv2.INTER_LINEAR,
+            # ).astype(np.uint8)
+            contours, hierarchy = cv2.findContours(curr_mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+            #print(contours)e
+            #print((max(contours, key = cv2.contourArea))//scale)
+            #print(color)
+            im_copy = im.copy()
+            cv2.drawContours(im_copy, [(max(contours, key = cv2.contourArea) / scale).astype(int) ] , -1, (*color,0.5), thickness=-1)
+            im = cv2.addWeighted(im_copy, 0.4, im, 0.6, 0)
+ 
     return im
 
 

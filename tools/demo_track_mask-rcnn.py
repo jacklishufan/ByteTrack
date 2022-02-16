@@ -4,7 +4,7 @@ import os.path as osp
 import time
 import cv2
 import torch
-
+import numpy as np
 from loguru import logger
 
 from yolox.data.data_augment import preproc
@@ -13,7 +13,7 @@ from yolox.utils import fuse_model, get_model_info, postprocess
 from yolox.utils.visualize import plot_tracking
 from yolox.tracker.byte_tracker import BYTETracker
 from yolox.tracking_utils.timer import Timer
-
+from mask_rcnn import predictor as mask_predictor
 
 IMAGE_EXT = [".jpg", ".jpeg", ".webp", ".bmp", ".png"]
 
@@ -132,23 +132,24 @@ class Predictor(object):
         self.test_size = exp.test_size
         self.device = device
         self.fp16 = fp16
-        if trt_file is not None:
-            from torch2trt import TRTModule
+        # if trt_file is not None:
+        #     from torch2trt import TRTModule
 
-            model_trt = TRTModule()
-            model_trt.load_state_dict(torch.load(trt_file))
+        #     model_trt = TRTModule()
+        #     model_trt.load_state_dict(torch.load(trt_file))
 
-            x = torch.ones((1, 3, exp.test_size[0], exp.test_size[1]), device=device)
-            self.model(x)
-            self.model = model_trt
+        #     x = torch.ones((1, 3, exp.test_size[0], exp.test_size[1]), device=device)
+        #     self.model(x)
+        #     self.model = model_trt
         self.rgb_means = (0.485, 0.456, 0.406)
         self.std = (0.229, 0.224, 0.225)
 
-    def inference(self, img, timer):
+    def inference(self, img, timer, mask_predictor = None):
         img_info = {"id": 0}
         if isinstance(img, str):
             img_info["file_name"] = osp.basename(img)
             img = cv2.imread(img)
+            #print(img.shape)
         else:
             img_info["file_name"] = None
 
@@ -156,22 +157,38 @@ class Predictor(object):
         img_info["height"] = height
         img_info["width"] = width
         img_info["raw_img"] = img
-
-        img, ratio = preproc(img, self.test_size, self.rgb_means, self.std)
+        
+        img, ratio = preproc(img, self.test_size, self.rgb_means, self.std,resize_only=True)
+        #print(img.shape)
         img_info["ratio"] = ratio
-        img = torch.from_numpy(img).unsqueeze(0).float().to(self.device)
-        if self.fp16:
-            img = img.half()  # to FP16
+        if not mask_predictor:
+            img = torch.from_numpy(img).unsqueeze(0).float().to(self.device)
+            if self.fp16:
+                img = img.half()  # to FP16
+            #print(img.shape)
+        else:
+            img = torch.permute(torch.FloatTensor(img),[1,2,0])
+            img = img.numpy()
+            #print(img.shape)
 
+        #cv2.imwrite('test.jpg',img)
+        #print(img)
         with torch.no_grad():
             timer.tic()
-            outputs = self.model(img)
-            if self.decoder is not None:
-                outputs = self.decoder(outputs, dtype=outputs.type())
-            outputs = postprocess(
-                outputs, self.num_classes, self.confthre, self.nmsthre
-            )
+            if mask_predictor:
+                print(img.shape)
+                outputs = mask_predictor(img)
+                outputs = outputs["instances"].to("cpu")
+                #print(outputs)
+            else:
+                outputs = self.model(img)
+                if self.decoder is not None:
+                    outputs = self.decoder(outputs, dtype=outputs.type())
+                outputs = postprocess(
+                    outputs, self.num_classes, self.confthre, self.nmsthre
+                )
             #logger.info("Infer time: {:.4f}s".format(time.time() - t0))
+        #exit()
         return outputs, img_info
 
 
@@ -186,29 +203,43 @@ def image_demo(predictor, vis_folder, current_time, args):
     results = []
 
     for frame_id, img_path in enumerate(files, 1):
-        outputs, img_info = predictor.inference(img_path, timer)
-        print(len(outputs),outputs)
-        if outputs[0] is not None:
-            online_targets = tracker.update(outputs[0], [img_info['height'], img_info['width']], exp.test_size)
-            print(online_targets)
+        #mask_predictor = None
+        outputs, img_info = predictor.inference(img_path, timer,mask_predictor=mask_predictor)
+        #print(outputs)
+        
+        boxes = outputs.pred_boxes.tensor.numpy()
+        masks =  outputs.pred_masks.numpy().astype(np.uint8)
+        scores = outputs.scores.numpy()
+        #print(boxes,masks,scores)
+        print("DONE")
+        r = np.concatenate([boxes,scores.reshape(-1,1)],axis=1)
+        #print(len(outputs),outputs)
+        if r is not None:
+            online_targets = tracker.update(r, [img_info['height'], img_info['width']], exp.test_size,masks=masks)
+            #print(online_targets)
             online_tlwhs = []
             online_ids = []
             online_scores = []
+            online_masks = []
+            online_scales = []
             for t in online_targets:
                 tlwh = t.tlwh
+                mask = t.mask
                 tid = t.track_id
                 vertical = tlwh[2] / tlwh[3] > args.aspect_ratio_thresh
                 if tlwh[2] * tlwh[3] > args.min_box_area and not vertical:
                     online_tlwhs.append(tlwh)
                     online_ids.append(tid)
                     online_scores.append(t.score)
+                    online_masks.append(mask)
+                    online_scales.append(t.scale)
                     # save results
                     results.append(
                         f"{frame_id},{tid},{tlwh[0]:.2f},{tlwh[1]:.2f},{tlwh[2]:.2f},{tlwh[3]:.2f},{t.score:.2f},-1,-1,-1\n"
                     )
             timer.toc()
             online_im = plot_tracking(
-                img_info['raw_img'], online_tlwhs, online_ids, frame_id=frame_id, fps=1. / timer.average_time
+                img_info['raw_img'], online_tlwhs, online_ids, frame_id=frame_id, fps=1. / timer.average_time,mask=online_masks,scale = online_scales[0]
             )
         else:
             timer.toc()
@@ -260,12 +291,22 @@ def imageflow_demo(predictor, vis_folder, current_time, args):
             logger.info('Processing frame {} ({:.2f} fps)'.format(frame_id, 1. / max(1e-5, timer.average_time)))
         ret_val, frame = cap.read()
         if ret_val:
-            outputs, img_info = predictor.inference(frame, timer)
-            if outputs[0] is not None:
-                online_targets = tracker.update(outputs[0], [img_info['height'], img_info['width']], exp.test_size)
+            #outputs, img_info = predictor.inference(frame, timer)
+            outputs, img_info = predictor.inference(frame, timer,mask_predictor=mask_predictor)
+        #print(outputs)
+        
+            boxes = outputs.pred_boxes.tensor.numpy()
+            masks =  outputs.pred_masks.numpy().astype(np.uint8)
+            scores = outputs.scores.numpy()
+            r = np.concatenate([boxes,scores.reshape(-1,1)],axis=1)
+        #print(len(outputs),outputs)
+            if r is not None:
+                online_targets = tracker.update(r, [img_info['height'], img_info['width']], exp.test_size,masks=masks)
                 online_tlwhs = []
                 online_ids = []
                 online_scores = []
+                online_masks = []
+                online_scales = []
                 for t in online_targets:
                     tlwh = t.tlwh
                     tid = t.track_id
@@ -274,12 +315,14 @@ def imageflow_demo(predictor, vis_folder, current_time, args):
                         online_tlwhs.append(tlwh)
                         online_ids.append(tid)
                         online_scores.append(t.score)
+                        online_masks.append(t.mask)
+                        online_scales.append(t.scale)
                         results.append(
                             f"{frame_id},{tid},{tlwh[0]:.2f},{tlwh[1]:.2f},{tlwh[2]:.2f},{tlwh[3]:.2f},{t.score:.2f},-1,-1,-1\n"
                         )
                 timer.toc()
                 online_im = plot_tracking(
-                    img_info['raw_img'], online_tlwhs, online_ids, frame_id=frame_id + 1, fps=1. / timer.average_time
+                img_info['raw_img'], online_tlwhs, online_ids, frame_id=frame_id, fps=1. / timer.average_time,mask=online_masks,scale = online_scales[0]
                 )
             else:
                 timer.toc()
